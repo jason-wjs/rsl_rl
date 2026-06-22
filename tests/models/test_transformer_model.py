@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tensordict import TensorDict
 
+from rsl_rl.models import TransformerModel
 from rsl_rl.modules import (
     HumanoidTransformer,
     HumanoidTransformerBlock,
@@ -18,6 +20,9 @@ from rsl_rl.modules import (
     SwiGLU,
     TaskEmbedder,
 )
+
+NUM_ENVS = 4
+NUM_ACTIONS = 3
 
 
 def test_transformer_building_blocks_are_importable() -> None:
@@ -144,3 +149,111 @@ def test_humanoid_transformer_rejects_invalid_constructor_config(
 
     with pytest.raises(ValueError, match=match):
         HumanoidTransformer(**config)
+
+
+def _make_transformer_obs(num_envs: int = NUM_ENVS, context: int = 3, task_tokens: int = 2) -> TensorDict:
+    return TensorDict(
+        {
+            "policy": torch.randn(num_envs, context, 5),
+            "policy_task": torch.randn(num_envs, task_tokens, 7),
+            "critic": torch.randn(num_envs, context, 6),
+            "critic_task": torch.randn(num_envs, task_tokens, 8),
+            "action": torch.randn(num_envs, context, NUM_ACTIONS),
+            "mode": torch.tensor([[1.0, 0.0]]).repeat(num_envs, 1),
+            "mode_mapping": torch.ones(num_envs, 7),
+        },
+        batch_size=[num_envs],
+    )
+
+
+def _make_actor(obs: TensorDict, **kwargs: object) -> TransformerModel:
+    defaults = {
+        "prop_obs_group": "policy",
+        "task_obs_group": "policy_task",
+        "action_obs_group": "action",
+        "mode_group": "mode",
+        "mode_mapping_group": "mode_mapping",
+        "embed_dim": 16,
+        "num_heads": 2,
+        "ff_dim": 32,
+        "num_layers": 1,
+        "distribution_cfg": {"class_name": "GaussianDistribution", "init_std": 0.8},
+    }
+    defaults.update(kwargs)
+    return TransformerModel(obs, {"actor": ["policy"], "critic": ["critic"]}, "actor", NUM_ACTIONS, **defaults)
+
+
+def _make_critic(obs: TensorDict, **kwargs: object) -> TransformerModel:
+    defaults = {
+        "prop_obs_group": "critic",
+        "task_obs_group": "critic_task",
+        "action_obs_group": "action",
+        "embed_dim": 16,
+        "num_heads": 2,
+        "ff_dim": 32,
+        "num_layers": 1,
+    }
+    defaults.update(kwargs)
+    return TransformerModel(obs, {"actor": ["policy"], "critic": ["critic"]}, "critic", 1, **defaults)
+
+
+def test_transformer_model_actor_returns_deterministic_distribution_output() -> None:
+    """Actor TransformerModel should return the distribution mean by default."""
+    obs = _make_transformer_obs()
+    actor = _make_actor(obs)
+
+    deterministic = actor(obs)
+    sampled = actor(obs, stochastic_output=True)
+
+    assert deterministic.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert sampled.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert actor.output_mean.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert actor.output_std.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert actor.output_entropy.shape == (NUM_ENVS,)
+    assert torch.allclose(deterministic, actor.output_mean, atol=1e-6)
+
+
+def test_transformer_model_critic_returns_value() -> None:
+    """Critic TransformerModel should return raw value output without a distribution."""
+    obs = _make_transformer_obs()
+    critic = _make_critic(obs)
+
+    value = critic(obs)
+
+    assert value.shape == (NUM_ENVS, 1)
+
+
+def test_transformer_model_promotes_2d_observations() -> None:
+    """2D prop, task, and action observations should be promoted to one-token 3D inputs."""
+    obs = TensorDict(
+        {
+            "policy": torch.randn(NUM_ENVS, 5),
+            "policy_task": torch.randn(NUM_ENVS, 7),
+            "action": torch.randn(NUM_ENVS, NUM_ACTIONS),
+        },
+        batch_size=[NUM_ENVS],
+    )
+    actor = TransformerModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        NUM_ACTIONS,
+        prop_obs_group="policy",
+        task_obs_group="policy_task",
+        action_obs_group="action",
+        embed_dim=16,
+        num_heads=2,
+        ff_dim=32,
+        num_layers=1,
+    )
+
+    assert actor(obs).shape == (NUM_ENVS, NUM_ACTIONS)
+
+
+def test_transformer_model_rejects_mismatched_context_lengths() -> None:
+    """Prop and action context lengths must match."""
+    obs = _make_transformer_obs(context=3)
+    obs["action"] = torch.randn(NUM_ENVS, 2, NUM_ACTIONS)
+
+    with pytest.raises(ValueError, match="same context length"):
+        _make_actor(obs)
