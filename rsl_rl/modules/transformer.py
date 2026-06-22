@@ -36,8 +36,8 @@ class RoPEPositionalEncoding(nn.Module):
     def _apply_rope(self, x: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor) -> torch.Tensor:
         x_even = x[:, :, 0::2]
         x_odd = x[:, :, 1::2]
-        cos_freqs = cos_freqs.unsqueeze(0)
-        sin_freqs = sin_freqs.unsqueeze(0)
+        cos_freqs = cos_freqs.to(dtype=x.dtype).unsqueeze(0)
+        sin_freqs = sin_freqs.to(dtype=x.dtype).unsqueeze(0)
 
         x_rotated = torch.zeros_like(x)
         x_rotated[..., 0::2] = x_even * cos_freqs - x_odd * sin_freqs
@@ -178,6 +178,19 @@ class HumanoidTransformer(nn.Module):
         num_layers: int = 4,
     ) -> None:
         super().__init__()
+        if embed_dim <= 0:
+            raise ValueError("embed_dim must be positive")
+        if ff_dim <= 0:
+            raise ValueError("ff_dim must be positive")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1")
+        if embed_dim % 2 != 0:
+            raise ValueError("embed_dim must be even")
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+
         self.embed_dim = embed_dim
         self.prop_projection = nn.Linear(prop_obs_dim, embed_dim)
         self.action_projection = nn.Linear(action_dim, embed_dim)
@@ -190,11 +203,24 @@ class HumanoidTransformer(nn.Module):
 
     def forward(self, prop_obs: torch.Tensor, action_obs: torch.Tensor, task_tokens: torch.Tensor) -> torch.Tensor:
         """Run transformer inference and return the final query-token projection."""
+        if prop_obs.dim() != 3:
+            raise ValueError("prop_obs must be a 3D tensor")
+        if action_obs.dim() != 3:
+            raise ValueError("action_obs must be a 3D tensor")
+        if task_tokens.dim() != 3:
+            raise ValueError("task_tokens must be a 3D tensor")
         if prop_obs.shape[:2] != action_obs.shape[:2]:
             raise ValueError("prop_obs and action_obs must have the same batch size and context length")
 
         batch_size = prop_obs.shape[0]
         context_size = prop_obs.shape[1]
+        if context_size < 1:
+            raise ValueError("context length must be at least 1")
+        if task_tokens.shape[0] != batch_size:
+            raise ValueError("task_tokens batch size must match prop_obs batch size")
+        if task_tokens.shape[-1] != self.embed_dim:
+            raise ValueError("task_tokens embedding dimension must equal embed_dim")
+
         prop_tokens = self.prop_projection(prop_obs)
         action_tokens = self.action_projection(action_obs)
 
