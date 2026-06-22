@@ -197,6 +197,17 @@ def _make_critic(obs: TensorDict, **kwargs: object) -> TransformerModel:
     return TransformerModel(obs, {"actor": ["policy"], "critic": ["critic"]}, "critic", 1, **defaults)
 
 
+class _CaptureTaskEmbedder(torch.nn.Module):
+    def __init__(self, embedding_dim: int = 16) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.last_task_obs: torch.Tensor | None = None
+
+    def forward(self, task_obs: torch.Tensor) -> torch.Tensor:
+        self.last_task_obs = task_obs.detach().clone()
+        return torch.zeros(*task_obs.shape[:-1], self.embedding_dim, dtype=task_obs.dtype, device=task_obs.device)
+
+
 def test_transformer_model_actor_returns_deterministic_distribution_output() -> None:
     """Actor TransformerModel should return the distribution mean by default."""
     obs = _make_transformer_obs()
@@ -257,3 +268,190 @@ def test_transformer_model_rejects_mismatched_context_lengths() -> None:
 
     with pytest.raises(ValueError, match="same context length"):
         _make_actor(obs)
+
+
+def test_transformer_model_multiplies_task_obs_by_mode_mapping() -> None:
+    """Mode mapping should be broadcast across task tokens and multiplied into task observations."""
+    task_obs = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]])
+    obs = TensorDict(
+        {
+            "policy": torch.ones(1, 2, 5),
+            "policy_task": task_obs.clone(),
+            "action": torch.zeros(1, 2, NUM_ACTIONS),
+            "mode_mapping": torch.tensor([[1.0, 0.0, 2.0]]),
+        },
+        batch_size=[1],
+    )
+    actor = TransformerModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        NUM_ACTIONS,
+        prop_obs_group="policy",
+        task_obs_group="policy_task",
+        action_obs_group="action",
+        mode_mapping_group="mode_mapping",
+        embed_dim=16,
+        num_heads=2,
+        ff_dim=32,
+        num_layers=1,
+    )
+    capture = _CaptureTaskEmbedder()
+    actor.task_embedder = capture
+
+    actor(obs)
+
+    assert capture.last_task_obs is not None
+    assert torch.allclose(capture.last_task_obs, task_obs * torch.tensor([[[1.0, 0.0, 2.0]]]))
+    assert torch.equal(obs["policy_task"], task_obs)
+
+
+def test_transformer_model_rejects_mode_mapping_final_dim_mismatch() -> None:
+    """Mode mapping final dimension must match the task observation dimension."""
+    obs = _make_transformer_obs()
+    obs["mode_mapping"] = torch.ones(NUM_ENVS, 6)
+
+    with pytest.raises(ValueError, match="mode_mapping final dimension must match task observation dimension"):
+        _make_actor(obs)
+
+
+def test_transformer_model_accepts_mode_2d_single_token_or_per_task_token() -> None:
+    """Mode observations should support [B, D], [B, 1, D], and [B, T, D] layouts."""
+    task_tokens = 3
+    mode_2d = torch.arange(NUM_ENVS * 2, dtype=torch.float32).reshape(NUM_ENVS, 2)
+    mode_single_token = mode_2d.unsqueeze(1)
+    mode_per_token = torch.arange(NUM_ENVS * task_tokens * 2, dtype=torch.float32).reshape(NUM_ENVS, task_tokens, 2)
+    cases = [
+        (mode_2d, mode_2d.unsqueeze(1).expand(-1, task_tokens, -1)),
+        (mode_single_token, mode_single_token.expand(-1, task_tokens, -1)),
+        (mode_per_token, mode_per_token),
+    ]
+
+    for mode, expected_mode in cases:
+        obs = _make_transformer_obs(task_tokens=task_tokens)
+        obs["mode"] = mode
+        actor = _make_actor(obs)
+        capture = _CaptureTaskEmbedder()
+        actor.task_embedder = capture
+
+        actor(obs)
+
+        assert capture.last_task_obs is not None
+        assert torch.equal(capture.last_task_obs[..., -2:], expected_mode)
+
+
+def test_transformer_model_rejects_invalid_mode_token_length() -> None:
+    """Mode token length must be one or match task observation token length."""
+    obs = _make_transformer_obs(task_tokens=3)
+    obs["mode"] = torch.ones(NUM_ENVS, 2, 2)
+
+    with pytest.raises(ValueError, match="mode token length must be 1 or match task observation token length"):
+        _make_actor(obs)
+
+
+@pytest.mark.parametrize(
+    ("missing_group", "match"),
+    [
+        ("policy_task", "Observation group 'policy_task' is missing"),
+        ("action", "Observation group 'action' is missing"),
+    ],
+)
+def test_transformer_model_reports_missing_configured_task_action_groups(missing_group: str, match: str) -> None:
+    """Configured task/action group misses should name the missing group."""
+    obs = _make_transformer_obs()
+    del obs[missing_group]
+
+    with pytest.raises(KeyError, match=match):
+        _make_actor(obs)
+
+
+@pytest.mark.parametrize(
+    ("obs", "kwargs", "match"),
+    [
+        (
+            TensorDict(
+                {
+                    "policy": torch.randn(NUM_ENVS, 5),
+                    "action": torch.randn(NUM_ENVS, NUM_ACTIONS),
+                },
+                batch_size=[NUM_ENVS],
+            ),
+            {"action_obs_group": "action"},
+            "task_obs_group must be provided unless observation group 'task' is present",
+        ),
+        (
+            TensorDict(
+                {
+                    "policy": torch.randn(NUM_ENVS, 5),
+                    "policy_task": torch.randn(NUM_ENVS, 7),
+                },
+                batch_size=[NUM_ENVS],
+            ),
+            {"task_obs_group": "policy_task"},
+            "action_obs_group must be provided unless observation group 'action' is present",
+        ),
+    ],
+)
+def test_transformer_model_reports_missing_default_task_action_groups(
+    obs: TensorDict, kwargs: dict[str, str], match: str
+) -> None:
+    """Default task/action group misses should explain which constructor argument is required."""
+    with pytest.raises(ValueError, match=match):
+        TransformerModel(
+            obs,
+            {"actor": ["policy"]},
+            "actor",
+            NUM_ACTIONS,
+            prop_obs_group="policy",
+            embed_dim=16,
+            num_heads=2,
+            ff_dim=32,
+            num_layers=1,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "distribution_cfg",
+    [
+        {"class_name": "HeteroscedasticGaussianDistribution", "init_std": 0.5},
+        {"class_name": "BetaDistribution"},
+    ],
+)
+def test_transformer_model_reshapes_two_slice_distribution_inputs(distribution_cfg: dict[str, object]) -> None:
+    """Distributions with [2, output_dim] inputs should work through the TransformerModel adapter."""
+    torch.manual_seed(0)
+    obs = _make_transformer_obs()
+    actor = _make_actor(obs, distribution_cfg=distribution_cfg)
+
+    latent = actor.get_latent(obs)
+    deterministic = actor(obs)
+    sampled = actor(obs, stochastic_output=True)
+    log_prob = actor.get_output_log_prob(sampled)
+
+    assert latent.shape == (NUM_ENVS, 2 * NUM_ACTIONS)
+    assert actor._reshape_distribution_input(latent).shape == (NUM_ENVS, 2, NUM_ACTIONS)
+    assert deterministic.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert sampled.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert log_prob.shape == (NUM_ENVS,)
+
+
+def test_transformer_model_normalization_updates_only_prop_sequence_dims() -> None:
+    """Observation normalization should flatten 3D prop sequences without including task/action values."""
+    obs = _make_transformer_obs(num_envs=2, context=2)
+    prop_obs = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0]],
+            [[11.0, 12.0, 13.0, 14.0, 15.0], [16.0, 17.0, 18.0, 19.0, 20.0]],
+        ]
+    )
+    obs["policy"] = prop_obs
+    obs["policy_task"] = torch.full_like(obs["policy_task"], 10_000.0)
+    obs["action"] = torch.full_like(obs["action"], -10_000.0)
+    actor = _make_actor(obs, obs_normalization=True)
+
+    actor.update_normalization(obs)
+
+    assert actor.obs_normalizer.count.item() == 4
+    assert actor.obs_normalizer.mean.shape == (5,)
+    assert torch.allclose(actor.obs_normalizer.mean, prop_obs.reshape(-1, 5).mean(dim=0))
