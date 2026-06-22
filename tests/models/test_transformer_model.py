@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     SwiGLU,
     TaskEmbedder,
 )
+from rsl_rl.utils import split_and_pad_trajectories
 
 NUM_ENVS = 4
 NUM_ACTIONS = 3
@@ -259,6 +260,29 @@ def test_transformer_model_promotes_2d_observations() -> None:
     )
 
     assert actor(obs).shape == (NUM_ENVS, NUM_ACTIONS)
+
+
+def test_transformer_model_handles_masked_recurrent_style_batches() -> None:
+    """Non-recurrent TransformerModel should accept unpadded recurrent batches with leading time/env dims."""
+    obs = _make_transformer_obs(num_envs=2, context=3, task_tokens=2)
+    actor = _make_actor(obs)
+    rollout_obs = TensorDict(
+        {
+            "policy": torch.randn(4, 2, 3, 5),
+            "policy_task": torch.randn(4, 2, 2, 7),
+            "action": torch.randn(4, 2, 3, NUM_ACTIONS),
+            "mode": torch.randn(4, 2, 2),
+            "mode_mapping": torch.ones(4, 2, 7),
+        },
+        batch_size=[4, 2],
+    )
+    dones = torch.zeros(4, 2, 1, dtype=torch.uint8)
+    dones[1, 0] = 1
+    padded_obs, masks = split_and_pad_trajectories(rollout_obs, dones)
+
+    output = actor(padded_obs, masks=masks)
+
+    assert output.shape == (4, 2, NUM_ACTIONS)
 
 
 def test_transformer_model_rejects_mismatched_context_lengths() -> None:

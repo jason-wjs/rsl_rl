@@ -334,53 +334,78 @@ def _make_transformer_obs(num_envs: int = NUM_ENVS) -> TensorDict:
     )
 
 
+def _make_transformer_ppo_cfg() -> dict:
+    """Create a small PPO config using TransformerModel for actor and critic."""
+    return {
+        "num_steps_per_env": NUM_STEPS,
+        "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
+        "multi_gpu": None,
+        "algorithm": {
+            "class_name": "PPO",
+            "num_learning_epochs": 1,
+            "num_mini_batches": 2,
+            "schedule": "fixed",
+        },
+        "actor": {
+            "class_name": "TransformerModel",
+            "prop_obs_group": "policy",
+            "task_obs_group": "policy_task",
+            "action_obs_group": "action",
+            "embed_dim": 16,
+            "num_heads": 2,
+            "ff_dim": 32,
+            "num_layers": 1,
+            "distribution_cfg": {"class_name": "GaussianDistribution", "init_std": 1.0},
+        },
+        "critic": {
+            "class_name": "TransformerModel",
+            "prop_obs_group": "critic",
+            "task_obs_group": "critic_task",
+            "action_obs_group": "action",
+            "embed_dim": 16,
+            "num_heads": 2,
+            "ff_dim": 32,
+            "num_layers": 1,
+        },
+    }
+
+
+class _TransformerEnv:
+    num_envs = NUM_ENVS
+    num_actions = NUM_ACTIONS
+
+
 class TestPPOConstruction:
     """Tests for constructing PPO through its config entrypoint."""
 
     def test_construct_algorithm_builds_transformer_actor_and_critic(self) -> None:
         """PPO.construct_algorithm should instantiate TransformerModel actor and critic from config."""
-
-        class Env:
-            num_envs = NUM_ENVS
-            num_actions = NUM_ACTIONS
-
         obs = _make_transformer_obs()
-        cfg = {
-            "num_steps_per_env": NUM_STEPS,
-            "obs_groups": {"actor": ["policy"], "critic": ["critic"]},
-            "multi_gpu": None,
-            "algorithm": {
-                "class_name": "PPO",
-                "num_learning_epochs": 1,
-                "num_mini_batches": 2,
-                "schedule": "fixed",
-            },
-            "actor": {
-                "class_name": "TransformerModel",
-                "prop_obs_group": "policy",
-                "task_obs_group": "policy_task",
-                "action_obs_group": "action",
-                "embed_dim": 16,
-                "num_heads": 2,
-                "ff_dim": 32,
-                "num_layers": 1,
-                "distribution_cfg": {"class_name": "GaussianDistribution", "init_std": 1.0},
-            },
-            "critic": {
-                "class_name": "TransformerModel",
-                "prop_obs_group": "critic",
-                "task_obs_group": "critic_task",
-                "action_obs_group": "action",
-                "embed_dim": 16,
-                "num_heads": 2,
-                "ff_dim": 32,
-                "num_layers": 1,
-            },
-        }
+        cfg = _make_transformer_ppo_cfg()
 
-        ppo = PPO.construct_algorithm(obs, Env(), cfg, "cpu")
+        ppo = PPO.construct_algorithm(obs, _TransformerEnv(), cfg, "cpu")
         actions = ppo.act(obs)
 
         assert isinstance(ppo.actor, TransformerModel)
         assert isinstance(ppo.critic, TransformerModel)
         assert actions.shape == (NUM_ENVS, NUM_ACTIONS)
+
+    def test_constructed_transformer_ppo_runs_one_update(self) -> None:
+        """Constructed TransformerModel PPO should run a full rollout/update smoke test."""
+        obs = _make_transformer_obs()
+        ppo = PPO.construct_algorithm(obs, _TransformerEnv(), _make_transformer_ppo_cfg(), "cpu")
+
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(
+                obs,
+                rewards=torch.randn(NUM_ENVS),
+                dones=torch.zeros(NUM_ENVS),
+                extras={},
+            )
+
+        ppo.compute_returns(obs)
+        losses = ppo.update()
+
+        assert set(losses) == {"value", "surrogate", "entropy"}
+        assert torch.isfinite(torch.tensor(list(losses.values()))).all()

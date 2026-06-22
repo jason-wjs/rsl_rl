@@ -52,7 +52,7 @@ class TransformerModel(nn.Module):
         self.mode_mapping_group = mode_mapping_group
         self.obs_groups = self._get_active_obs_groups()
 
-        prop_obs, task_obs, action_obs = self._prepare_inputs(obs, normalize_prop=False)
+        prop_obs, task_obs, action_obs, _ = self._prepare_inputs(obs, normalize_prop=False)
         self.prop_obs_dim = prop_obs.shape[-1]
         self.task_obs_dim = task_obs.shape[-1]
         self.action_obs_dim = action_obs.shape[-1]
@@ -119,9 +119,10 @@ class TransformerModel(nn.Module):
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
         """Return the raw transformer head output before distribution handling."""
-        prop_obs, task_obs, action_obs = self._prepare_inputs(obs)
+        prop_obs, task_obs, action_obs, leading_shape = self._prepare_inputs(obs)
         task_tokens = self.task_embedder(task_obs)
-        return self.transformer(prop_obs, action_obs, task_tokens)
+        transformer_output = self.transformer(prop_obs, action_obs, task_tokens)
+        return self._restore_leading_shape(transformer_output, leading_shape)
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the internal state for recurrent models (no-op)."""
@@ -188,21 +189,27 @@ class TransformerModel(nn.Module):
     def update_normalization(self, obs: TensorDict) -> None:
         """Update prop-observation normalization statistics from a batch of observations."""
         if self.obs_normalization:
-            prop_obs = self._promote_to_sequence(self._get_obs(obs, self.prop_obs_group), self.prop_obs_group)
+            prop_obs, _ = self._prepare_sequence_obs(self._get_obs(obs, self.prop_obs_group), self.prop_obs_group)
             self._validate_feature_dim(prop_obs, self.prop_obs_dim, self.prop_obs_group)
             self.obs_normalizer.update(prop_obs.reshape(-1, prop_obs.shape[-1]))  # type: ignore
 
     def _prepare_inputs(
         self, obs: TensorDict, normalize_prop: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        prop_obs = self._promote_to_sequence(self._get_obs(obs, self.prop_obs_group), self.prop_obs_group)
-        task_obs = self._promote_to_sequence(self._get_obs(obs, self.task_obs_group), self.task_obs_group)
-        action_obs = self._promote_to_sequence(self._get_obs(obs, self.action_obs_group), self.action_obs_group)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+        prop_obs, leading_shape = self._prepare_sequence_obs(
+            self._get_obs(obs, self.prop_obs_group), self.prop_obs_group
+        )
+        task_obs, task_leading_shape = self._prepare_sequence_obs(
+            self._get_obs(obs, self.task_obs_group), self.task_obs_group
+        )
+        action_obs, action_leading_shape = self._prepare_sequence_obs(
+            self._get_obs(obs, self.action_obs_group), self.action_obs_group
+        )
 
-        if prop_obs.shape[:2] != action_obs.shape[:2]:
-            raise ValueError("prop_obs and action_obs must have the same context length and batch size")
-        if task_obs.shape[0] != prop_obs.shape[0]:
-            raise ValueError("task_obs batch size must match prop_obs batch size")
+        if leading_shape != action_leading_shape or prop_obs.shape[1] != action_obs.shape[1]:
+            raise ValueError("prop_obs and action_obs must have the same context length and leading batch shape")
+        if task_leading_shape != leading_shape:
+            raise ValueError("task_obs leading batch shape must match prop_obs leading batch shape")
 
         self._validate_known_feature_dims(prop_obs, task_obs, action_obs)
 
@@ -210,7 +217,7 @@ class TransformerModel(nn.Module):
             mode_mapping = self._prepare_token_aligned_obs(
                 obs,
                 self.mode_mapping_group,
-                task_obs.shape[0],
+                leading_shape,
                 task_obs.shape[1],
                 label="mode_mapping",
             )
@@ -222,7 +229,7 @@ class TransformerModel(nn.Module):
             mode = self._prepare_token_aligned_obs(
                 obs,
                 self.mode_group,
-                task_obs.shape[0],
+                leading_shape,
                 task_obs.shape[1],
                 label="mode",
             )
@@ -233,26 +240,35 @@ class TransformerModel(nn.Module):
 
         if normalize_prop:
             prop_obs = self.obs_normalizer(prop_obs)
-        return prop_obs, task_obs, action_obs
+        return prop_obs, task_obs, action_obs, leading_shape
 
     def _prepare_token_aligned_obs(
-        self, obs: TensorDict, group: str, batch_size: int, token_count: int, label: str
+        self, obs: TensorDict, group: str, leading_shape: tuple[int, ...], token_count: int, label: str
     ) -> torch.Tensor:
-        tensor = self._promote_to_sequence(self._get_obs(obs, group), group)
-        if tensor.shape[0] != batch_size:
-            raise ValueError(f"{label} batch size must match task observation batch size")
-        if tensor.shape[1] == 1:
-            return tensor.expand(-1, token_count, -1)
-        if tensor.shape[1] != token_count:
-            raise ValueError(f"{label} token length must be 1 or match task observation token length")
-        return tensor
+        tensor = self._get_obs(obs, group)
+        if tuple(tensor.shape[: len(leading_shape)]) != leading_shape:
+            raise ValueError(f"{label} leading batch shape must match task observation leading batch shape")
+        if tensor.dim() == len(leading_shape) + 1:
+            tensor = tensor.unsqueeze(-2)
+        elif tensor.dim() != len(leading_shape) + 2:
+            raise ValueError(
+                f"Observation group '{group}' must end with feature or token-feature dimensions, got shape "
+                f"{tensor.shape}."
+            )
 
-    def _promote_to_sequence(self, tensor: torch.Tensor, group: str) -> torch.Tensor:
+        if tensor.shape[-2] == 1:
+            tensor = tensor.expand(*leading_shape, token_count, tensor.shape[-1])
+        elif tensor.shape[-2] != token_count:
+            raise ValueError(f"{label} token length must be 1 or match task observation token length")
+        return tensor.reshape(math.prod(leading_shape), token_count, tensor.shape[-1])
+
+    def _prepare_sequence_obs(self, tensor: torch.Tensor, group: str) -> tuple[torch.Tensor, tuple[int, ...]]:
         if tensor.dim() == 2:
-            return tensor.unsqueeze(1)
-        if tensor.dim() == 3:
-            return tensor
-        raise ValueError(f"Observation group '{group}' must be a 2D or 3D tensor, got shape {tensor.shape}.")
+            return tensor.unsqueeze(1), (tensor.shape[0],)
+        if tensor.dim() >= 3:
+            leading_shape = tuple(tensor.shape[:-2])
+            return tensor.reshape(math.prod(leading_shape), tensor.shape[-2], tensor.shape[-1]), leading_shape
+        raise ValueError(f"Observation group '{group}' must be at least a 2D tensor, got shape {tensor.shape}.")
 
     def _get_obs(self, obs: TensorDict, group: str) -> torch.Tensor:
         try:
@@ -322,6 +338,9 @@ class TransformerModel(nn.Module):
         if self._distribution_input_shape is None or isinstance(self._distribution_input_shape, int):
             return transformer_output
         return transformer_output.reshape(*transformer_output.shape[:-1], *self._distribution_input_shape)
+
+    def _restore_leading_shape(self, transformer_output: torch.Tensor, leading_shape: tuple[int, ...]) -> torch.Tensor:
+        return transformer_output.reshape(*leading_shape, transformer_output.shape[-1])
 
     def _make_distribution_head_proxy(self) -> nn.Sequential:
         if self._distribution_input_shape is None or isinstance(self._distribution_input_shape, int):
