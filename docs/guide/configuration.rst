@@ -288,8 +288,9 @@ Model Configuration
 Different algorithms use models for different purposes. For example, :class:`~rsl_rl.algorithms.ppo.PPO` uses an actor
 and a critic, while :class:`~rsl_rl.algorithms.distillation.Distillation` uses a student and a teacher. Even though
 their function might be different, they can all use the same underlying model classes. RSL-RL currently implements
-three different models: :class:`~rsl_rl.models.mlp_model.MLPModel`, :class:`~rsl_rl.models.rnn_model.RNNModel`, and
-:class:`~rsl_rl.models.cnn_model.CNNModel`, which are configured as follows.
+four different models: :class:`~rsl_rl.models.mlp_model.MLPModel`, :class:`~rsl_rl.models.rnn_model.RNNModel`,
+:class:`~rsl_rl.models.cnn_model.CNNModel`, and :class:`~rsl_rl.models.transformer_model.TransformerModel`, which are
+configured as follows.
 
 MLPModel
 ^^^^^^^^
@@ -446,6 +447,102 @@ configuration includes the following parameters:
      - bool
      - ``True``
      - Whether to flatten the output tensor.
+
+TransformerModel
+^^^^^^^^^^^^^^^^
+
+The :class:`~rsl_rl.models.transformer_model.TransformerModel` processes structured observation sequences with
+separate proprioceptive, task, and previous-action observation groups. It is non-recurrent from the PPO interface
+perspective, but each observation group may be provided either as ``[batch, dim]`` or as a token sequence
+``[batch, context, dim]``. Two-dimensional inputs are promoted to one-token sequences.
+
+Unlike :class:`~rsl_rl.models.mlp_model.MLPModel`, the transformer model does not concatenate every group listed in
+``obs_groups``. The ``obs_groups`` entry still selects the actor or critic observation set, but
+``prop_obs_group``, ``task_obs_group``, and ``action_obs_group`` define the structured inputs consumed by the
+transformer.
+
+.. list-table::
+   :header-rows: 1
+   :class: no-wrap-type-column
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``class_name``
+     - str
+     - required
+     - Model class name. Valid value: ``"TransformerModel"``.
+   * - ``prop_obs_group``
+     - str | None
+     - first group in ``obs_groups[obs_set]``
+     - Proprioceptive observation group. Its context length must match ``action_obs_group``.
+   * - ``task_obs_group``
+     - str | None
+     - ``"task"`` if present
+     - Task observation group used to build cross-attention tokens.
+   * - ``action_obs_group``
+     - str | None
+     - ``"action"`` if present
+     - Previous-action observation group. Its context length must match ``prop_obs_group``.
+   * - ``mode_group``
+     - str | None
+     - ``None``
+     - Optional mode token group concatenated to the task observation. It may have token length ``1`` or match the
+       task-token length.
+   * - ``mode_mapping_group``
+     - str | None
+     - ``None``
+     - Optional elementwise task mapping group. Its final dimension must match the task observation dimension.
+   * - ``embed_dim``
+     - int
+     - ``256``
+     - Transformer token embedding dimension. It must be even and divisible by ``num_heads``.
+   * - ``num_heads``
+     - int
+     - ``4``
+     - Number of attention heads.
+   * - ``ff_dim``
+     - int
+     - ``256``
+     - Hidden dimension of the SwiGLU feed-forward blocks.
+   * - ``num_layers``
+     - int
+     - ``4``
+     - Number of transformer blocks.
+   * - ``reduced_task_dim``
+     - int | None
+     - ``None``
+     - Optional reduced task-embedding dimension before projection to ``embed_dim``.
+   * - ``task_embedder_hidden_dims``
+     - list[int] | None
+     - ``None``
+     - Optional hidden dimensions for the task embedder.
+   * - ``obs_normalization``
+     - bool
+     - ``False``
+     - Whether to normalize proprioceptive observations before the transformer.
+   * - ``distribution_cfg``
+     - dict | None
+     - ``None``
+     - Optional output distribution configuration, using the same distribution modules as the MLP model.
+
+For example, a PPO actor can be configured as follows:
+
+.. code-block:: yaml
+
+   actor:
+     class_name: TransformerModel
+     prop_obs_group: policy
+     task_obs_group: policy_task
+     action_obs_group: action
+     embed_dim: 128
+     num_heads: 4
+     ff_dim: 256
+     num_layers: 4
+     distribution_cfg:
+       class_name: GaussianDistribution
+       init_std: 1.0
 
 
 Distribution Configuration

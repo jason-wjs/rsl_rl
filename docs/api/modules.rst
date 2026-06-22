@@ -25,6 +25,14 @@ CNN
    :undoc-members:
 
 
+Transformer
+-----------
+
+.. automodule:: rsl_rl.modules.transformer
+   :members:
+   :undoc-members:
+
+
 Normalization
 -------------
 
@@ -39,4 +47,3 @@ Distribution
 .. automodule:: rsl_rl.modules.distribution
    :members:
    :undoc-members:
-

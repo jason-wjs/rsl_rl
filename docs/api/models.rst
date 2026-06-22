@@ -24,3 +24,10 @@ CNN Model
    :members:
    :undoc-members:
 
+
+Transformer Model
+-----------------
+
+.. automodule:: rsl_rl.models.transformer_model
+   :members:
+   :undoc-members:
